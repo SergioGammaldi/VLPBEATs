@@ -1,29 +1,33 @@
 #!/usr/bin/env python3
+
 import os
 import glob
 import logging
+import signal
+import sys
+import faulthandler
+from random import random
 from optuna.trial import TrialState
-import os
+import optuna
+from optuna.samplers import TPESampler
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import optuna
-from optuna.samplers import TPESampler
-import faulthandler, signal, sys
-
-# Enable for fatal errors on all threads:
-faulthandler.enable(file=sys.stderr, all_threads=True)
-
-# If you want to trigger a dump manually via kill -USR1 <pid>:
-faulthandler.register(signal.SIGUSR1, file=sys.stderr, all_threads=True)
 
 from tools_cm import compute_confusion_matrix, f1_score
 import plot_repository
 
 # ----------------------------
+# Fault handler for debugging
+# ----------------------------
+faulthandler.enable(file=sys.stderr, all_threads=True)
+faulthandler.register(signal.SIGUSR1, file=sys.stderr, all_threads=True)
+
+# ----------------------------
 # 1) Data Loading / Preprocess
 # ----------------------------
 def load_and_preprocess_data(pwd, folder_neolo, catalog_path, start, end):
+    """Load and preprocess VLP data and catalog within a date range."""
     txt_files = []
     dates = pd.date_range(start, end, freq="D").strftime("%Y%m%d")
     for d in dates:
@@ -36,37 +40,39 @@ def load_and_preprocess_data(pwd, folder_neolo, catalog_path, start, end):
         try:
             dfs.append(pd.read_csv(f))
         except pd.errors.ParserError as e:
-            print(f"❌ Failed to parse {f}: {e}")
+            logging.warning(f"Failed to parse {f}: {e}")
+
     if not dfs:
         raise RuntimeError("No VLP files loaded!")
-    df = pd.concat(dfs, ignore_index=True)
 
-    # datetime cleanup
+    df = pd.concat(dfs, ignore_index=True)
     df["start_vlp_iso"] = pd.to_datetime(df["start_vlp_iso"]).dt.tz_localize(None)
     df["tca_iso"] = pd.to_datetime(df["tca_iso"], errors="coerce").dt.tz_localize(None)
     df["tca_iso_sec"] = df["tca_iso"].dt.round("S")
 
-    # drop dupes
+    # Remove duplicates
     df.drop_duplicates(subset=["station", "start_vlp_iso"], inplace=True)
     df.drop_duplicates(subset=["station", "tca_iso_sec"], inplace=True)
 
-    # time window filter
+    # Filter by time window
     mask = (df["start_vlp_iso"] >= start) & (df["start_vlp_iso"] < end)
     df = df.loc[mask].sort_values("start_vlp_iso")
 
-    # manual catalog
+    # Load catalog
     cat = pd.read_csv(catalog_path)
     cat["datetime"] = pd.to_datetime(cat["datetime"])
     cat = cat[(cat["datetime"] >= start) & (cat["datetime"] < end)]
 
     return df, cat
 
+
 # ----------------------------
-# 2) Objective
+# 2) Objective for Optuna
 # ----------------------------
 def objective(trial, station, df_neolo, cat_str, dti, tolerance, results_list):
+    """Optuna objective function for per-station hyperparameter tuning."""
     try:
-        # parameter grid
+        # Suggest parameters
         max_tca = trial.suggest_int("max_tca", 4000, 12000, step=1000)
         max_rsam = trial.suggest_int("max_rsam", 4000, 12000, step=1000)
         az_max = trial.suggest_int("azimuth_max_std", 8, 20)
@@ -76,7 +82,7 @@ def objective(trial, station, df_neolo, cat_str, dti, tolerance, results_list):
         plan_min = trial.suggest_float("planarity_min", 0.3, 0.8, step=0.05)
         plan_max = trial.suggest_float("planarity_max", 0.8, 1, step=0.001)
 
-        # filter
+        # Filter data for the station
         sub = df_neolo.query(
             "station==@station & "
             "max_tca.fillna(1e12)<=@max_tca & rsam.fillna(1e12)<=@max_rsam & "
@@ -85,22 +91,20 @@ def objective(trial, station, df_neolo, cat_str, dti, tolerance, results_list):
             "planarity_tca>=@plan_min & planarity_tca<=@plan_max"
         )
 
-        # confusion matrix & F1
+        # Compute confusion matrix and F1
         cm_df = compute_confusion_matrix(dti, sub, cat_str, tolerance, [station])
         if cm_df.empty:
-            return 0.0
-
-        # average non-zero metrics
-        for c in ["f1-score", "pr", "rc"]:
-            cm_df[c] = cm_df[cm_df[c] != 0].groupby("station")[c].transform("mean")
-
-        best_f1 = cm_df["f1-score"].max()
+            best_f1 = 0.0
+        else:
+            # Average non-zero metrics per station
+            for c in ["f1-score", "pr", "rc"]:
+                cm_df[c] = cm_df[cm_df[c] != 0].groupby("station")[c].transform("mean")
+            best_f1 = cm_df["f1-score"].max()
     except Exception as e:
-        # catch underflows, overflows, etc.
         logging.warning(f"Trial error for station {station}: {e}")
         best_f1 = 0.0
 
-    # record
+    # Record trial
     results_list.append({
         "iteration": len(results_list) + 1,
         "f1-score": best_f1,
@@ -117,12 +121,13 @@ def objective(trial, station, df_neolo, cat_str, dti, tolerance, results_list):
         }
     })
     return best_f1
-# ----------------------------
-# 3) Per‐Station Optimization
-# ----------------------------
 
 
+# ----------------------------
+# 3) Per-Station Optimization
+# ----------------------------
 def run_optimizations(df_neolo, cat_str, dti, tolerance, pwd, test_name):
+    """Run Optuna optimization per station and save results."""
     sampler = TPESampler(
         consider_prior=True,
         prior_weight=1.0,
@@ -139,7 +144,6 @@ def run_optimizations(df_neolo, cat_str, dti, tolerance, pwd, test_name):
 
     stations = ["STRA", "STR1", "STR8", "STR6", "STR9", "STRD", "STRB", "STR5"]
     best_params = {}
-
     TARGET_TRIALS = 150
 
     for st in stations:
@@ -152,8 +156,7 @@ def run_optimizations(df_neolo, cat_str, dti, tolerance, pwd, test_name):
             storage=storage_url,
             load_if_exists=True,
         )
-        
-        # Count completed trials via Study.trials
+
         completed = sum(1 for t in study.trials if t.state == TrialState.COMPLETE)
         print(f"Station {st}: {completed} completed trials on disk.")
 
@@ -170,38 +173,33 @@ def run_optimizations(df_neolo, cat_str, dti, tolerance, pwd, test_name):
             n_trials=to_run,
         )
 
-        total_done = completed + sum(1 for t in study.trials if t.state == TrialState.COMPLETE) - completed
         print(f"✔ Station {st} now has {completed + len(results)} completed trials; Best F1 = {study.best_value:.3f}")
-
-        pd.DataFrame(results).to_csv(
-            f"{result_dir}/trials_{st}.csv", index=False
-        )
+        pd.DataFrame(results).to_csv(f"{result_dir}/trials_{st}.csv", index=False)
         best_params[st] = study.best_params
 
-    # Save best_params
-    pd.DataFrame([
-        {"station": st, **best_params[st]}
-        for st in best_params
-    ]).to_csv(f"{pwd}/{folder_neolo}/best_params_{test_name}.csv", index=False)
+    # Save best parameters
+    best_df = pd.DataFrame([{"station": st, **best_params[st]} for st in best_params])
+    best_df.to_csv(os.path.join(pwd, folder_neolo, f"best_params_{test_name}.csv"), index=False)
 
     return studies_dir, result_dir
+
+
 def load_and_filter_trials(db_path, study_name=None):
-    """Load an Optuna study from a SQLite file and return a filtered DataFrame."""
+    """Load an Optuna study from a SQLite file and filter completed trials."""
     storage = f"sqlite:///{db_path}"
-    # If study_name is None, Optuna will pick the only study inside the DB.
     study = optuna.load_study(study_name=study_name, storage=storage)
     df = study.trials_dataframe(attrs=("number", "value", "state"))
-    # keep only completed trials with finite, non-null F1 scores
     df = df[df["state"] == "COMPLETE"]
     df = df[df["value"].notnull() & df["value"].apply(lambda v: pd.api.types.is_scalar(v))]
-    df = df[df["value"] != float("inf")][df["value"] != float("-inf")]
+    df = df[(df["value"] != float("inf")) & (df["value"] != float("-inf"))]
     return df.sort_values("number"), study
 
 
 # ----------------------------
-# 4) Plot Studies After Optuna
+# 4) Plot Optuna Studies
 # ----------------------------
 def plot_all_studies_improved(studies_dir, result_dir):
+    """Plot all F1 scores across stations with smoothing."""
     dbs = glob.glob(os.path.join(studies_dir, "study_*.db"))
     target_stations = ["STRA", "STR1", "STR8", "STR6", "STR9", "STRD", "STRB", "STR5"]
     combined = {}
@@ -210,9 +208,8 @@ def plot_all_studies_improved(studies_dir, result_dir):
         station = os.path.basename(db).replace("study_", "").replace(".db", "")
         if station not in target_stations:
             continue
-
         try:
-            df, _ = load_and_filter_trials(db, study_name=None)
+            df, _ = load_and_filter_trials(db)
             combined[station] = df
         except Exception as e:
             logging.warning(f"Could not load data for {station}: {e}")
@@ -221,19 +218,15 @@ def plot_all_studies_improved(studies_dir, result_dir):
         logging.warning("No valid studies found to plot.")
         return
 
-    # Plot all stations in subplots
     num_stations = len(combined)
     fig, axes = plt.subplots(nrows=num_stations, ncols=1, figsize=(10, 3 * num_stations), sharex=True)
-    
     if num_stations == 1:
-        axes = [axes]  # ensure axes is iterable
+        axes = [axes]
 
     for ax, (station, df) in zip(axes, combined.items()):
         ax.plot(df["number"], df["value"], marker="o", linestyle="-", alpha=0.5, label="Raw F1")
-        # Rolling average for smoothing
-        df_sorted = df.sort_values("number")
-        rolling = df_sorted["value"].rolling(window=5, min_periods=1).mean()
-        ax.plot(df_sorted["number"], rolling, color="red", linewidth=2, label="Smoothed F1")
+        rolling = df.sort_values("number")["value"].rolling(window=5, min_periods=1).mean()
+        ax.plot(df["number"], rolling, color="red", linewidth=2, label="Smoothed F1")
         ax.set_ylabel(f"{station}\nF1")
         ax.set_ylim(0, 1)
         ax.grid(True)
@@ -241,104 +234,35 @@ def plot_all_studies_improved(studies_dir, result_dir):
 
     axes[-1].set_xlabel("Trial number")
     fig.suptitle("F1 Score vs Iteration — All Stations", fontsize=14)
-    fig.tight_layout(rect=[0, 0, 1, 0.97])  # leave space for suptitle
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
     plt.savefig(os.path.join(result_dir, "f1_all_stations_improved.png"))
     plt.close()
-def plot_all_studies(studies_dir, result_dir):
-    dbs = glob.glob(os.path.join(studies_dir, "study_*.db"))
-    combined = {}
-    target_stations = ["STRA", "STR1", "STR8", "STR6", "STR9", "STRD", "STRB", "STR5"]
 
-    for db in dbs:
-        station = os.path.basename(db).replace("study_", "").replace(".db", "")
-        
-        if station not in target_stations:
-            continue
-
-        try:
-            df, _ = load_and_filter_trials(db, study_name=None)
-            combined[station] = df
-
-            # Individual station plot
-            plt.figure(figsize=(8, 5))
-            plt.plot(df["number"], df["value"], marker="o")
-            plt.title(f"{station} — F1 vs Iteration")
-            plt.xlabel("Trial number")
-            plt.ylabel("F1 score")
-            plt.grid(True)
-            plt.savefig(f"{result_dir}/f1_{station}.png")
-            plt.close()
-        except Exception as e:
-            logging.warning(f"Could not plot {station}: {e}")
-
-    # Multi-row subplot figure
-    if combined:
-        n_stations = len(combined)
-        fig, axes = plt.subplots(n_stations, 1, figsize=(10, 3 * n_stations), sharex=True)
-        if n_stations == 1:
-            axes = [axes]  # Ensure iterable
-
-        for ax, (station, df) in zip(axes, combined.items()):
-            ax.plot(df["number"], df["value"], marker="o")
-            ax.set_ylabel(f"{station}\nF1")
-            ax.grid(True)
-
-        axes[-1].set_xlabel("Trial number")
-        fig.suptitle("F1 Score vs Iteration — All Stations", fontsize=14)
-        plt.tight_layout(rect=[0, 0, 1, 0.97])
-        plt.savefig(f"{result_dir}/f1_all_stations.png")
-        plt.close()
 
 # ----------------------------
 # 5) Main Pipeline
 # ----------------------------
 if __name__ == "__main__":
-    # parameters
-    pwd            = "/home/sergio/Documenti/stromboli_vlp"
-    folder_neolo   = "neolo"
-    catalog_path   = "./catalogho_stromboli.csv"
-    test_name      = "condition"
-    start, end     = "2007-01-01", "2008-01-01"
-    tolerance      = 60
-    dti            = pd.date_range(start, end, freq="D")
+    pwd = "/home/sergio/Documenti/stromboli_vlp"
+    folder_neolo = "neolo"
+    catalog_path = "./catalogho_stromboli.csv"
+    test_name = "condition"
+    start, end = "2007-01-01", "2008-01-01"
+    tolerance = 60
+    dti = pd.date_range(start, end, freq="D")
 
-    # 1) load data
-    df_neolo, cat_str = load_and_preprocess_data(
-        pwd, folder_neolo, catalog_path, start, end
-    )
+    # Load VLP data
+    df_neolo, cat_str = load_and_preprocess_data(pwd, folder_neolo, catalog_path, start, end)
 
-    # 2) run optuna per station
-    studies_dir, results_dir = run_optimizations(
-        df_neolo, cat_str, dti, tolerance, pwd, test_name
-    )
+    # Run Optuna optimization per station
+    studies_dir, results_dir = run_optimizations(df_neolo, cat_str, dti, tolerance, pwd, test_name)
 
-    # 3) plot all studies
+    # Plot all studies
     plot_all_studies_improved(studies_dir, results_dir)
-    # 4) combine best-filtered VLPs & compute final confusion matrix
-    best_params_df = pd.read_csv(f"{pwd}/{folder_neolo}/best_params_{test_name}.csv")
+
+    # Combine best filtered VLPs & compute final confusion matrix
+    best_params_df = pd.read_csv(os.path.join(pwd, folder_neolo, f"best_params_{test_name}.csv"))
     frames = []
-    print(best_params_df.station.tolist())
+
     cm = compute_confusion_matrix(dti, df_neolo, cat_str, tolerance, best_params_df.station.tolist())
-    cm.to_csv(f"{results_dir}/previous_confusion_matrix.csv", index=False)
-    for _, row in best_params_df.iterrows():
-        st = row["station"]
-        filt = (
-            (df_neolo.station == st) &
-            (df_neolo.max_tca <= row.max_tca) &
-            (df_neolo.rsam <= row.max_rsam) &
-            (df_neolo.azimuth <= row.azimuth_max_std) &
-            (df_neolo.incidence <= row.incidence_max_std) &
-            (df_neolo.rectilinearity_tca.between(row.rect_min, row.rect_max)) &
-            (df_neolo.planarity_tca.between(row.planarity_min, row.planarity_max))
-        )
-        frames.append(df_neolo.loc[filt])
-
-    df_best_all = pd.concat(frames, ignore_index=True)
-    df_best_all.to_csv(f"{pwd}/{folder_neolo}/vlp_best_filtered_{test_name}.csv", index=False)
-    cm = compute_confusion_matrix(dti, df_best_all, cat_str, tolerance, best_params_df.station.tolist())
-    cm.to_csv(f"{results_dir}/final_confusion_matrix.csv", index=False)
-
-    # plot final rates/scores
-    plot_repository.plot_rate_and_score(
-        results_dir, tolerance, folder_neolo, start, end
-    )
+    cm

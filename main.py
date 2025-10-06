@@ -30,7 +30,7 @@ def main_pol_dataset(cfgs):
     fmin, fmax = cfgs['Parameter']['frequency_band_filters_butterworth']
     overlap, overlap2 = cfgs['Parameter']['overlaps']
     tm1 = cfgs['Parameter']['time_window1']
-    tm2 = cfgs['Parameter']['time_window2']
+    tm2 = cfgs['Parameter']['window_polarization']
 
     win = 60 * tm1
 
