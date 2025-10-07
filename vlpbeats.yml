@@ -202,4 +202,4 @@ dependencies:
     - pygmt==0.7.0
     - utm==0.7.0
     - xarray==2022.12.0
-prefix: /home/sergio/anaconda3/envs/semiai
+prefix: /path/to/your/conda/envs/vlpbeats
