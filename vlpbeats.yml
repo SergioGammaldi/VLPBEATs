@@ -194,6 +194,7 @@ dependencies:
   - zipp=3.7.0=pyhd3eb1b0_0
   - zlib=1.2.12=h7f8727e_2
   - zstd=1.4.9=haebb681_0
+  - optuna
   - pip:
     - cftime==1.6.2
     - netcdf4==1.6.2
