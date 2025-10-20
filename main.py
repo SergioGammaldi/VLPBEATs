@@ -80,16 +80,10 @@ def main_pol_dataset(cfgs):
 
 
                 try:
-            
-                    st=client1.get_waveforms("*", stat, "*", "*HH*", start,end)             
-                except ValueError as e:
-                    print(e)    
-                if len(st)==0:   
-                    try:
-                        st=client1.get_waveforms("*", stat, "", "*EH*", start,end) 
-                    except ValueError as e:
-                        print(e)
-                        continue
+                    st = client1.get_waveforms('*', stat, "*", "HH*", start, end)
+                except ValueError:
+                    print(ValueError)
+                    continue
 
                 if len(st) != 3:
                     continue
