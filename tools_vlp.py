@@ -493,7 +493,7 @@ def detect(stream: obspy.Stream, inner_overlap: float, low_frequency: float, hig
 
     try:
 
-        stz1, stn1, ste1 = filters_new(stz, stn, ste, low_frequency, high_frequency, False, 4)
+        stz1, stn1, ste1 = filters_new(stz, stn, ste, low_frequency, high_frequency, integrate, 4)
 
     except ValueError as e:
         print(e)
